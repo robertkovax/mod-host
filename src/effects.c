@@ -262,6 +262,7 @@ enum PostPonedEventType {
     POSTPONED_OUTPUT_MONITOR,
     POSTPONED_MIDI_PROGRAM_CHANGE,
     POSTPONED_MIDI_MAP,
+    POSTPONED_MIDI_CAPTURE,
     POSTPONED_TRANSPORT,
     POSTPONED_JACK_MIDI_CONNECT,
     POSTPONED_LOG_TRACE, // stack allocated, rt-safe
@@ -540,6 +541,7 @@ typedef struct MIDI_CC_T {
     int effect_id;
     const char* symbol;
     port_t* port;
+    int midi_mode;
 } midi_cc_t;
 
 typedef struct ASSIGNMENT_T {
@@ -578,7 +580,14 @@ typedef struct POSTPONED_MIDI_MAP_EVENT_T {
     float value;
     float minimum;
     float maximum;
+    int midi_mode;
 } postponed_midi_map_event_t;
+
+typedef struct {
+    int effect_id, channel, controller;
+    char symbol[MAX_CHAR_BUF_SIZE + 1];
+    char token[17];
+} postponed_midi_capture_event_t;
 
 typedef struct POSTPONED_TRANSPORT_EVENT_T {
     bool rolling;
@@ -609,6 +618,7 @@ typedef struct POSTPONED_EVENT_T {
         postponed_parameter_event_t parameter;
         postponed_midi_program_change_event_t program_change;
         postponed_midi_map_event_t midi_map;
+        postponed_midi_capture_event_t midi_capture;
         postponed_transport_event_t transport;
         postponed_jack_midi_connect_event_t jack_midi_connect;
         postponed_log_trace_event_t log_trace;
@@ -671,6 +681,10 @@ typedef struct RAW_MIDI_PORT_ITEM {
 
 static effect_t g_effects[MAX_INSTANCES];
 static midi_cc_t g_midi_cc_list[MAX_MIDI_CC_ASSIGN], *g_midi_learning;
+static struct {
+    bool active;
+    postponed_midi_capture_event_t event;
+} g_midi_capture;
 
 #ifdef HAVE_CONTROLCHAIN
 /* Control Chain */
@@ -1251,16 +1265,27 @@ static void RunPostPonedEvents(int ignored_effect_id)
             strncpy(cached_output_mon.last_symbol, eventptr->event.parameter.symbol, MAX_CHAR_BUF_SIZE);
             break;
 
+        case POSTPONED_MIDI_CAPTURE:
+            if (eventptr->event.midi_capture.effect_id == ignored_effect_id) continue;
+            snprintf(buf, FEEDBACK_BUF_SIZE, "midi_captured %i %s %i %i %s",
+                     eventptr->event.midi_capture.effect_id, eventptr->event.midi_capture.symbol,
+                     eventptr->event.midi_capture.channel, eventptr->event.midi_capture.controller,
+                     eventptr->event.midi_capture.token);
+            socket_send_feedback_debug(buf);
+            socket_send_feedback(buf);
+            break;
+
         case POSTPONED_MIDI_MAP:
             if (eventptr->event.midi_map.effect_id == ignored_effect_id)
                 continue;
-            snprintf(buf, FEEDBACK_BUF_SIZE, "midi_mapped %i %s %i %i %f %f %f", eventptr->event.midi_map.effect_id,
+            snprintf(buf, FEEDBACK_BUF_SIZE, "midi_mapped %i %s %i %i %f %f %f %d", eventptr->event.midi_map.effect_id,
                                                                                  eventptr->event.midi_map.symbol,
                                                                                  eventptr->event.midi_map.channel,
                                                                                  eventptr->event.midi_map.controller,
                                                                                  eventptr->event.midi_map.value,
                                                                                  eventptr->event.midi_map.minimum,
-                                                                                 eventptr->event.midi_map.maximum);
+                                                                                 eventptr->event.midi_map.maximum,
+                                                                                 eventptr->event.midi_map.midi_mode);
             socket_send_feedback_debug(buf);
             break;
 
@@ -2314,16 +2339,24 @@ static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypas
     return true;
 }
 
+static bool MidiPortSupportsToggle(const port_t* port)
+{
+    return port && (port->hints & HINT_TOGGLE) && !(port->hints & HINT_TRIGGER);
+}
+
 // FIXME merge most of this with SetPortValue
 static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
 {
+    if (mcc->midi_mode == MIDI_FOLLOW_INVERTED)
+        mvalue = (highres ? 16383 : 127) - mvalue;
+
     const uint16_t mvaluediv = highres ? 8192 : 64;
 
     if (!strcmp(mcc->symbol, g_bypass_port_symbol))
     {
         effect_t *effect = &g_effects[mcc->effect_id];
 
-        const bool bypassed = mvalue < mvaluediv;
+        const bool bypassed = mcc->midi_mode == MIDI_TOGGLE_ON_PRESS ? effect->bypass < 0.5f : mvalue < mvaluediv;
         effect->bypass = bypassed ? 1.0f : 0.0f;
 
         if (effect->enabled_index >= 0)
@@ -2343,11 +2376,13 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
     else if (port->hints & HINT_TOGGLE)
     {
         // toggle, always min or max
-        value = mvalue >= mvaluediv ? port->max_value : port->min_value;
+        value = mcc->midi_mode == MIDI_TOGGLE_ON_PRESS
+            ? (*(port->buffer) < (port->min_value + port->max_value) * 0.5f ? port->max_value : port->min_value)
+            : (mvalue >= mvaluediv ? port->max_value : port->min_value);
 
         if (mcc->effect_id == GLOBAL_EFFECT_ID && !strcmp(mcc->symbol, g_rolling_port_symbol))
         {
-            if (mvalue >= mvaluediv)
+            if (value == port->max_value)
             {
                 jack_transport_start(g_jack_global_client);
             }
@@ -2465,7 +2500,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
     uint16_t mvalue;
     float value;
     double dvalue;
-    bool handled, highres, needs_post = false;
+    bool highres, needs_post = false;
     enum UpdatePositionFlag pos_flag = UPDATE_POSITION_IF_CHANGED;
 
 #ifdef HAVE_HYLIA
@@ -2617,9 +2652,32 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             continue;
         }
 
-        handled = false;
         channel = (event.buffer[0] & 0x0F);
 
+        postponed_event_list_data* capture_event = NULL;
+        pthread_mutex_lock(&g_midi_learning_mutex);
+        if (g_midi_capture.active)
+        {
+            capture_event = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+            if (capture_event)
+            {
+                capture_event->event.type = POSTPONED_MIDI_CAPTURE;
+                capture_event->event.midi_capture = g_midi_capture.event;
+                capture_event->event.midi_capture.channel = channel;
+                capture_event->event.midi_capture.controller = controller;
+                g_midi_capture.active = false;
+            }
+        }
+        pthread_mutex_unlock(&g_midi_learning_mutex);
+        if (capture_event)
+        {
+            pthread_mutex_lock(&g_rtsafe_mutex);
+            list_add_tail(&capture_event->siblings, &g_rtsafe_list);
+            pthread_mutex_unlock(&g_rtsafe_mutex);
+            needs_post = true;
+        }
+
+        pthread_mutex_lock(&g_midi_learning_mutex);
         for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
         {
             if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
@@ -2627,11 +2685,13 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             if (g_midi_cc_list[j].effect_id == ASSIGNMENT_UNUSED)
                 continue;
 
-            // TODO: avoid race condition against effects_midi_unmap
             if (g_midi_cc_list[j].channel    == channel &&
                 g_midi_cc_list[j].controller == controller)
             {
-                handled = true;
+                // Ignore releases only for this toggle binding; other bindings
+                // on the same channel/CC still need to receive the event.
+                if (g_midi_cc_list[j].midi_mode == MIDI_TOGGLE_ON_PRESS && (highres || mvalue < 64))
+                    continue;
                 value = UpdateValueFromMidi(&g_midi_cc_list[j], mvalue, highres);
 
                 postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
@@ -2650,19 +2710,31 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                     needs_post = true;
                 }
 
-                break;
+                // Continue through every binding for this MIDI signal.
             }
         }
 
-        if (! handled)
+        pthread_mutex_unlock(&g_midi_learning_mutex);
+
+        // An already-mapped signal can also teach a new control. The pending
+        // binding still has channel -1 during the loop above, so it is applied
+        // exactly once here, including toggle-on-press learning.
         {
             int effect_id;
             const char* symbol;
             float minimum, maximum;
+            int midi_mode = MIDI_FOLLOW_VALUE;
 
             pthread_mutex_lock(&g_midi_learning_mutex);
             if (g_midi_learning != NULL)
             {
+                // A release or pitchbend must not complete toggle-mode MIDI learn.
+                if (g_midi_learning->midi_mode == MIDI_TOGGLE_ON_PRESS && (highres || mvalue < 64))
+                {
+                    pthread_mutex_unlock(&g_midi_learning_mutex);
+                    continue;
+                }
+                midi_mode = g_midi_learning->midi_mode;
                 effect_id = g_midi_learning->effect_id;
                 symbol    = g_midi_learning->symbol;
                 minimum   = g_midi_learning->minimum;
@@ -2692,6 +2764,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                     posteventptr->event.midi_map.value      = value;
                     posteventptr->event.midi_map.minimum    = minimum;
                     posteventptr->event.midi_map.maximum    = maximum;
+                    posteventptr->event.midi_map.midi_mode = midi_mode;
 
                     pthread_mutex_lock(&g_rtsafe_mutex);
                     list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
@@ -5619,7 +5692,7 @@ int effects_remove(int effect_id)
     {
         pthread_mutex_lock(&g_midi_learning_mutex);
         g_midi_learning = NULL;
-        pthread_mutex_unlock(&g_midi_learning_mutex);
+        g_midi_capture.active = false;
 
         for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
         {
@@ -5631,6 +5704,8 @@ int effects_remove(int effect_id)
             g_midi_cc_list[j].symbol = NULL;
             g_midi_cc_list[j].port = NULL;
         }
+
+        pthread_mutex_unlock(&g_midi_learning_mutex);
 
 #ifdef HAVE_CONTROLCHAIN
         if (g_cc_client)
@@ -5734,7 +5809,8 @@ int effects_remove(int effect_id)
             g_midi_learning->port = NULL;
             g_midi_learning = NULL;
         }
-        pthread_mutex_unlock(&g_midi_learning_mutex);
+
+        if (g_midi_capture.active && g_midi_capture.event.effect_id == effect_id) g_midi_capture.active = false;
 
         for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
         {
@@ -5753,6 +5829,8 @@ int effects_remove(int effect_id)
             g_midi_cc_list[j].symbol = NULL;
             g_midi_cc_list[j].port = NULL;
         }
+
+        pthread_mutex_unlock(&g_midi_learning_mutex);
 
 #ifdef HAVE_CONTROLCHAIN
         for (int i = 0; i < CC_MAX_DEVICES; i++)
@@ -6616,6 +6694,11 @@ int effects_get_parameter_info(int effect_id, const char *control_symbol, float 
 
 int effects_midi_learn(int effect_id, const char *control_symbol, float minimum, float maximum)
 {
+    return effects_midi_learn_mode(effect_id, control_symbol, minimum, maximum, 0);
+}
+
+int effects_midi_learn_mode(int effect_id, const char *control_symbol, float minimum, float maximum, int midi_mode)
+{
     port_t *port;
 
     if (!InstanceExist(effect_id))
@@ -6624,6 +6707,14 @@ int effects_midi_learn(int effect_id, const char *control_symbol, float minimum,
     }
 
     const bool is_bypass = !strcmp(control_symbol, g_bypass_port_symbol);
+    if (midi_mode < MIDI_FOLLOW_VALUE || midi_mode > MIDI_FOLLOW_INVERTED)
+        return ERR_ASSIGNMENT_INVALID_OP;
+    port = is_bypass ? NULL : FindEffectInputPortBySymbol(&(g_effects[effect_id]), control_symbol);
+    if (!is_bypass && !port)
+        return ERR_LV2_INVALID_PARAM_SYMBOL;
+    if (midi_mode == MIDI_TOGGLE_ON_PRESS && !is_bypass && !MidiPortSupportsToggle(port))
+        return ERR_LV2_INVALID_PARAM_SYMBOL;
+    effects_midi_unmap(effect_id, control_symbol);
 
     pthread_mutex_lock(&g_midi_learning_mutex);
     if (g_midi_learning != NULL)
@@ -6649,6 +6740,7 @@ int effects_midi_learn(int effect_id, const char *control_symbol, float minimum,
 
         g_midi_cc_list[i].channel = -1;
         g_midi_cc_list[i].controller = 0;
+        g_midi_cc_list[i].midi_mode = midi_mode;
 
         if (!is_bypass)
         {
@@ -6689,6 +6781,7 @@ int effects_midi_learn(int effect_id, const char *control_symbol, float minimum,
         g_midi_cc_list[i].channel = -1;
         g_midi_cc_list[i].controller = 0;
         g_midi_cc_list[i].effect_id = effect_id;
+        g_midi_cc_list[i].midi_mode = midi_mode;
 
         pthread_mutex_lock(&g_midi_learning_mutex);
         g_midi_learning = &g_midi_cc_list[i];
@@ -6701,106 +6794,102 @@ int effects_midi_learn(int effect_id, const char *control_symbol, float minimum,
 
 int effects_midi_map(int effect_id, const char *control_symbol, int channel, int controller, float minimum, float maximum)
 {
-    port_t *port;
+    return effects_midi_map_mode(effect_id, control_symbol, channel, controller, minimum, maximum, 0);
+}
 
-    if (!InstanceExist(effect_id))
+int effects_midi_map_mode(int effect_id, const char *control_symbol, int channel, int controller, float minimum, float maximum, int midi_mode)
+{
+    const midi_binding_t binding = {channel, controller, midi_mode, minimum, maximum};
+    return effects_midi_set(effect_id, control_symbol, 1, &binding);
+}
+
+int effects_midi_set(int effect_id, const char *symbol, int count, const midi_binding_t *bindings)
+{
+    if (!InstanceExist(effect_id)) return ERR_INSTANCE_NON_EXISTS;
+    const bool bypass = !strcmp(symbol, g_bypass_port_symbol);
+    port_t* port = bypass ? NULL : FindEffectInputPortBySymbol(&(g_effects[effect_id]), symbol);
+    if (!bypass && !port) return ERR_LV2_INVALID_PARAM_SYMBOL;
+    if (count < 0 || count > MAX_MIDI_BINDINGS_PER_CONTROL) return ERR_ASSIGNMENT_INVALID_OP;
+    for (int i = 0; i < count; ++i)
     {
-        return ERR_INSTANCE_NON_EXISTS;
+        const midi_binding_t* b = &bindings[i];
+        if (b->channel < 0 || b->channel > 15 || (b->controller < 0 || (b->controller > 127 && b->controller != MIDI_PITCHBEND_AS_CC)) ||
+            b->mode < 0 || b->mode > 2 || (b->mode == MIDI_TOGGLE_ON_PRESS && ((!bypass && !MidiPortSupportsToggle(port)) || b->controller > 127)) ||
+            !isfinite(b->minimum) || !isfinite(b->maximum) || b->minimum >= b->maximum)
+            return ERR_ASSIGNMENT_INVALID_OP;
+        for (int j = 0; j < i; ++j)
+            if (bindings[j].channel == b->channel && bindings[j].controller == b->controller)
+                return ERR_ASSIGNMENT_INVALID_OP;
     }
-
-    const bool is_bypass = !strcmp(control_symbol, g_bypass_port_symbol);
-
-    // update current mapping first if it exists
-    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
+    int slots[MAX_MIDI_CC_ASSIGN], available = 0;
+    pthread_mutex_lock(&g_midi_learning_mutex);
+    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; ++i)
+        if (!INSTANCE_IS_VALID(g_midi_cc_list[i].effect_id) ||
+            (g_midi_cc_list[i].effect_id == effect_id && !strcmp(g_midi_cc_list[i].symbol, symbol)))
+            slots[available++] = i;
+    if (available < count) { pthread_mutex_unlock(&g_midi_learning_mutex); return ERR_ASSIGNMENT_LIST_FULL; }
+    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; ++i)
     {
-        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_NULL)
-            break;
-        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_UNUSED)
-            continue;
-        if (g_midi_cc_list[i].effect_id != effect_id)
-            continue;
-        if (strcmp(g_midi_cc_list[i].symbol, control_symbol))
-            continue;
-
-        g_midi_cc_list[i].channel = channel;
-        g_midi_cc_list[i].controller = controller;
-
-        if (!is_bypass)
-        {
-            g_midi_cc_list[i].minimum = minimum;
-            g_midi_cc_list[i].maximum = maximum;
-        }
-
-        return SUCCESS;
+        midi_cc_t* m = &g_midi_cc_list[i];
+        if (m->effect_id != effect_id || !m->symbol || strcmp(m->symbol, symbol)) continue;
+        if (g_midi_learning == m) g_midi_learning = NULL;
+        m->effect_id = ASSIGNMENT_UNUSED; m->symbol = NULL; m->port = NULL; m->channel = -1;
     }
-
-    // Otherwise locate a free position on list and take it
-    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
+    for (int i = 0; i < count; ++i)
     {
-        if (INSTANCE_IS_VALID(g_midi_cc_list[i].effect_id))
-            continue;
-
-        if (is_bypass)
-        {
-            g_midi_cc_list[i].symbol = g_bypass_port_symbol;
-            g_midi_cc_list[i].port = NULL;
-        }
-        else
-        {
-            port = FindEffectInputPortBySymbol(&(g_effects[effect_id]), control_symbol);
-
-            if (port == NULL)
-                return ERR_LV2_INVALID_PARAM_SYMBOL;
-
-            g_midi_cc_list[i].minimum = minimum;
-            g_midi_cc_list[i].maximum = maximum;
-            g_midi_cc_list[i].symbol = port->symbol;
-            g_midi_cc_list[i].port = port;
-        }
-
-        g_midi_cc_list[i].channel = channel;
-        g_midi_cc_list[i].controller = controller;
-        g_midi_cc_list[i].effect_id = effect_id;
-        return SUCCESS;
+        midi_cc_t* m = &g_midi_cc_list[slots[i]];
+        m->effect_id = effect_id; m->symbol = bypass ? g_bypass_port_symbol : port->symbol; m->port = port;
+        m->channel = bindings[i].channel; m->controller = bindings[i].controller;
+        m->minimum = bindings[i].minimum; m->maximum = bindings[i].maximum; m->midi_mode = bindings[i].mode;
     }
-
-    return ERR_ASSIGNMENT_LIST_FULL;
+    if (g_midi_capture.active && g_midi_capture.event.effect_id == effect_id && !strcmp(g_midi_capture.event.symbol, symbol))
+        g_midi_capture.active = false;
+    pthread_mutex_unlock(&g_midi_learning_mutex);
+    return SUCCESS;
 }
 
 int effects_midi_unmap(int effect_id, const char *control_symbol)
 {
-    if (!InstanceExist(effect_id))
+    if (!InstanceExist(effect_id)) return ERR_INSTANCE_NON_EXISTS;
+    int found = 0;
+    pthread_mutex_lock(&g_midi_learning_mutex);
+    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; ++i)
     {
-        return ERR_INSTANCE_NON_EXISTS;
+        midi_cc_t* m = &g_midi_cc_list[i];
+        if (m->effect_id != effect_id || !m->symbol || strcmp(m->symbol, control_symbol)) continue;
+        if (g_midi_learning == m) g_midi_learning = NULL;
+        m->effect_id = ASSIGNMENT_UNUSED; m->symbol = NULL; m->port = NULL; m->channel = -1;
+        found = 1;
     }
+    if (g_midi_capture.active && g_midi_capture.event.effect_id == effect_id && !strcmp(g_midi_capture.event.symbol, control_symbol))
+        g_midi_capture.active = false;
+    pthread_mutex_unlock(&g_midi_learning_mutex);
+    return found ? SUCCESS : ERR_LV2_INVALID_PARAM_SYMBOL;
+}
 
-    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
-    {
-        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_NULL)
-            break;
-        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_UNUSED)
-            continue;
-        if (g_midi_cc_list[i].effect_id != effect_id)
-            continue;
-        if (strcmp(g_midi_cc_list[i].symbol, control_symbol))
-            continue;
+int effects_midi_capture(int effect_id, const char *symbol, const char *token)
+{
+    if (!InstanceExist(effect_id)) return ERR_INSTANCE_NON_EXISTS;
+    if (strlen(symbol) > MAX_CHAR_BUF_SIZE || strlen(token) != 16 || strspn(token, "0123456789abcdef") != 16)
+        return ERR_ASSIGNMENT_INVALID_OP;
+    if (strcmp(symbol, g_bypass_port_symbol) && !FindEffectInputPortBySymbol(&(g_effects[effect_id]), symbol))
+        return ERR_LV2_INVALID_PARAM_SYMBOL;
+    pthread_mutex_lock(&g_midi_learning_mutex);
+    g_midi_capture.event.effect_id = effect_id;
+    strcpy(g_midi_capture.event.symbol, symbol); strcpy(g_midi_capture.event.token, token);
+    g_midi_capture.active = true;
+    pthread_mutex_unlock(&g_midi_learning_mutex);
+    return SUCCESS;
+}
 
-        pthread_mutex_lock(&g_midi_learning_mutex);
-        if (g_midi_learning == &g_midi_cc_list[i])
-            g_midi_learning = NULL;
-        pthread_mutex_unlock(&g_midi_learning_mutex);
-
-        g_midi_cc_list[i].channel = -1;
-        g_midi_cc_list[i].controller = 0;
-        g_midi_cc_list[i].minimum = 0.0f;
-        g_midi_cc_list[i].maximum = 1.0f;
-        g_midi_cc_list[i].effect_id = ASSIGNMENT_UNUSED;
-        g_midi_cc_list[i].symbol = NULL;
-        g_midi_cc_list[i].port = NULL;
-        return SUCCESS;
-    }
-
-    return ERR_LV2_INVALID_PARAM_SYMBOL;
+int effects_midi_capture_cancel(int effect_id, const char *symbol, const char *token)
+{
+    pthread_mutex_lock(&g_midi_learning_mutex);
+    if (g_midi_capture.active && g_midi_capture.event.effect_id == effect_id &&
+        !strcmp(g_midi_capture.event.symbol, symbol) && !strcmp(g_midi_capture.event.token, token))
+        g_midi_capture.active = false;
+    pthread_mutex_unlock(&g_midi_learning_mutex);
+    return SUCCESS;
 }
 
 int effects_licensee(int effect_id, char **licensee_ptr)
