@@ -152,6 +152,18 @@ int effects_bypass(int effect_id, int value);
 int effects_get_parameter_symbols(int effect_id, int output_ports, const char** symbols);
 int effects_get_presets_uris(int effect_id, const char **uris);
 int effects_get_parameter_info(int effect_id, const char *control_symbol, float **range, const char **scale_points);
+enum MidiControlMode { MIDI_FOLLOW_VALUE = 0, MIDI_TOGGLE_ON_PRESS = 1, MIDI_FOLLOW_INVERTED = 2 };
+int effects_midi_learn_mode(int effect_id, const char *control_symbol, float minimum, float maximum, int midi_mode);
+int effects_midi_map_mode(int effect_id, const char *control_symbol, int channel, int controller, float minimum, float maximum, int midi_mode);
+#define MAX_MIDI_BINDINGS_PER_CONTROL 32
+typedef struct {
+    int channel, controller, mode;
+    float minimum, maximum;
+} midi_binding_t;
+int effects_midi_set(int effect_id, const char *symbol, int count, const midi_binding_t *bindings);
+int effects_midi_capture(int effect_id, const char *symbol, const char *token);
+int effects_midi_capture_cancel(int effect_id, const char *symbol, const char *token);
+
 int effects_midi_learn(int effect_id, const char *control_symbol, float minimum, float maximum);
 int effects_midi_map(int effect_id, const char *control_symbol, int channel, int controller, float minimum, float maximum);
 int effects_midi_unmap(int effect_id, const char *control_symbol);

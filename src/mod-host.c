@@ -307,17 +307,47 @@ static void monitor_midi_program_cb(proto_t *proto)
 static void midi_learn_cb(proto_t *proto)
 {
     int resp;
-    resp = !effects_midi_learn(atoi(proto->list[1]), proto->list[2], atof(proto->list[3]), atof(proto->list[4]));
+    resp = !effects_midi_learn_mode(atoi(proto->list[1]), proto->list[2], atof(proto->list[3]), atof(proto->list[4]),
+                                    (!strcmp(proto->list[0], "midi_learn_toggle") ? MIDI_TOGGLE_ON_PRESS :
+                                     !strcmp(proto->list[0], "midi_learn_inverted") ? MIDI_FOLLOW_INVERTED : MIDI_FOLLOW_VALUE));
     protocol_response_int(resp, proto);
 }
 
 static void midi_map_cb(proto_t *proto)
 {
     int resp;
-    resp = !effects_midi_map(atoi(proto->list[1]), proto->list[2],
+    resp = !effects_midi_map_mode(atoi(proto->list[1]), proto->list[2],
                              atoi(proto->list[3]), atoi(proto->list[4]),
-                             atof(proto->list[5]), atof(proto->list[6]));
+                             atof(proto->list[5]), atof(proto->list[6]),
+                             (!strcmp(proto->list[0], "midi_map_toggle") ? MIDI_TOGGLE_ON_PRESS :
+                              !strcmp(proto->list[0], "midi_map_inverted") ? MIDI_FOLLOW_INVERTED : MIDI_FOLLOW_VALUE));
     protocol_response_int(resp, proto);
+}
+
+static void midi_set_cb(proto_t *proto)
+{
+    const int count = atoi(proto->list[3]);
+    midi_binding_t bindings[MAX_MIDI_BINDINGS_PER_CONTROL];
+    if (count < 0 || count > MAX_MIDI_BINDINGS_PER_CONTROL || proto->list_count != (uint32_t)(4 + 5 * count))
+    { protocol_response("resp 0", proto); return; }
+    for (int i = 0; i < count; ++i)
+    {
+        const int n = 4 + i * 5;
+        bindings[i].channel = atoi(proto->list[n]);
+        bindings[i].controller = atoi(proto->list[n+1]);
+        bindings[i].minimum = atof(proto->list[n+2]);
+        bindings[i].maximum = atof(proto->list[n+3]);
+        bindings[i].mode = atoi(proto->list[n+4]);
+    }
+    protocol_response_int(!effects_midi_set(atoi(proto->list[1]), proto->list[2], count, bindings), proto);
+}
+
+static void midi_capture_cb(proto_t *proto)
+{
+    const int result = !strcmp(proto->list[0], "midi_capture_cancel") ?
+        effects_midi_capture_cancel(atoi(proto->list[1]), proto->list[2], proto->list[3]) :
+        effects_midi_capture(atoi(proto->list[1]), proto->list[2], proto->list[3]);
+    protocol_response_int(!result, proto);
 }
 
 static void midi_unmap_cb(proto_t *proto)
@@ -691,9 +721,16 @@ static int mod_host_init(jack_client_t* client, int socket_port, int feedback_po
     protocol_add_command(MONITOR_ADDR_SET, monitor_addr_set_cb);
     protocol_add_command(MONITOR_OUTPUT, monitor_output_cb);
     protocol_add_command(MONITOR_MIDI_PROGRAM, monitor_midi_program_cb);
+    protocol_add_command(MIDI_LEARN_INVERTED, midi_learn_cb);
+    protocol_add_command(MIDI_MAP_INVERTED, midi_map_cb);
+    protocol_add_command(MIDI_LEARN_TOGGLE, midi_learn_cb);
+    protocol_add_command(MIDI_MAP_TOGGLE, midi_map_cb);
     protocol_add_command(MIDI_LEARN, midi_learn_cb);
     protocol_add_command(MIDI_MAP, midi_map_cb);
     protocol_add_command(MIDI_UNMAP, midi_unmap_cb);
+    protocol_add_command(MIDI_SET, midi_set_cb);
+    protocol_add_command(MIDI_CAPTURE_CANCEL, midi_capture_cb);
+    protocol_add_command(MIDI_CAPTURE, midi_capture_cb);
     protocol_add_command(CC_MAP, cc_map_cb);
     protocol_add_command(CC_VALUE_SET, cc_value_set_cb);
     protocol_add_command(CC_UNMAP, cc_unmap_cb);
